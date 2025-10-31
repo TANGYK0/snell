@@ -21,7 +21,7 @@ sudo sysctl net.ipv4.tcp_available_congestion_control
 # Download and install snell
 cd
 ARCH=$(uname -m)
-BASE_URL="https://dl.nssurge.com/snell/snell-server-v4.1.1-linux"
+BASE_URL="https://dl.nssurge.com/snell/snell-server-v5.0.0-linux"
 case $ARCH in
     "x86_64")
         PACKAGE="${BASE_URL}-amd64.zip"
@@ -57,4 +57,4 @@ sudo systemctl enable snell
 # print snell server info
 echo
 echo "Copy the following line to Surge, under the [Proxy] section:" 
-echo "$(curl -s ipinfo.io/city) = snell, $(curl -s ipinfo.io/ip), $(cat snell-server.conf | grep -i listen | cut --delimiter=':' -f2), psk=$(grep 'psk' snell-server.conf | cut -d= -f2 | tr -d ' '), version=4, tfo=true"
+echo "$(curl -s ipinfo.io/city) = snell, $(curl -s ipinfo.io/ip), $(cat snell-server.conf | grep -i listen | cut --delimiter=':' -f2), psk=$(grep 'psk' snell-server.conf | cut -d= -f2 | tr -d ' '), version=5, tfo=true"
