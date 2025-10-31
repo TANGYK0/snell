@@ -50,7 +50,7 @@ unzip -o ${PACKAGE##*/}
 
 # Create systemd service
 echo -e "[Unit]\nDescription=snell server\n[Service]\nUser=$(whoami)\nWorkingDirectory=$HOME\nExecStart=$HOME/snell-server\nRestart=always\n[Install]\nWantedBy=multi-user.target" | sudo tee /etc/systemd/system/snell.service > /dev/null
-echo "y" | sudo ./snell-server
+echo "y" | sudo ./snell-server > /dev/null
 echo "test";
 sudo systemctl stop snell > /dev/null
 sudo systemctl start snell
