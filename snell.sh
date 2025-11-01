@@ -34,8 +34,9 @@ case "$ARCH" in
         ;;
 esac
 
-wget -q --show-progress -O snell.zip "$PACKAGE"
+wget -q -O snell.zip "$PACKAGE"
 unzip -o snell.zip
+rm -rf snell.zip
 chmod +x snell-server
 
 # ===== 4. 生成一个可用端口 =====
