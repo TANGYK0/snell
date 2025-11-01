@@ -34,7 +34,7 @@ case "$ARCH" in
         ;;
 esac
 
-wget -O snell.zip "$PACKAGE"
+wget -q --show-progress -O snell.zip "$PACKAGE"
 unzip -o snell.zip
 chmod +x snell-server
 
