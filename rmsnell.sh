@@ -5,6 +5,4 @@ sudo systemctl disable snell.service
 sudo rm -f /etc/systemd/system/snell.service
 
 cd
-rm -f rm snell-server-v4*
-rm -f snell-server
-rm -f snell-server.conf
+rm -f rm snell*
