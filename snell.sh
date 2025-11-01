@@ -148,5 +148,5 @@ echo " 监听端口: $PORT"
 echo " PSK      : $PSK"
 echo
 echo "Surge/Clash 可用示例："
-echo "${CITY} = snell, ${PUBLIC_IP}, ${PORT}, psk=${PSK}, version=4, tfo=true"
+echo "${CITY} = snell, ${PUBLIC_IP}, ${PORT}, psk=${PSK}, version=5, tfo=true"
 echo "================================================="
