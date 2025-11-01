@@ -1,4 +1,4 @@
-# Snell v4 Installation Script
+# Snell v5 Installation Script
 
 [Snell Protocol Official Manual](https://manual.nssurge.com/others/snell.html)
 ## Install
