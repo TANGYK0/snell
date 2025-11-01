@@ -37,7 +37,8 @@ esac
 wget -q -O snell.zip "$PACKAGE"
 unzip -o snell.zip
 rm -rf snell.zip
-chmod +x snell-server
+mv snell-server /usr/bin/snell-server
+chmod +x /usr/bin/snell-server
 
 # ===== 4. 生成一个可用端口 =====
 find_free_port() {
@@ -126,7 +127,7 @@ After=network.target
 
 [Service]
 User=root
-ExecStart=/root/snell-server -c /etc/snell/snell-server.conf
+ExecStart=/usr/bin/snell-server -c /etc/snell/snell-server.conf
 Restart=always
 RestartSec=3
 
@@ -136,7 +137,7 @@ EOF
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now snell
-sudo systemctl start snell
+sudo systemctl restart snell
 
 # ===== 8. 打印出来给你贴 Surge/Clash =====
 PUBLIC_IP=$(curl -s https://ipinfo.io/ip || curl -s https://ifconfig.me || echo "SERVER_IP")
