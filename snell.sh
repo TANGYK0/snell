@@ -362,4 +362,573 @@ find_free_port() {
     return 1
 }
 
-determine_port()
+determine_port() {
+    local port
+
+    if [[ -n "${CUSTOM_PORT}" ]]; then
+        port="${CUSTOM_PORT}"
+
+        if ! validate_port "${port}"; then
+            log_error "端口无效: ${port}"
+            log_error "有效范围为 1 到 65535。"
+            exit 1
+        fi
+
+        if ! port_is_available "${port}"; then
+            log_error "端口 ${port} 已被占用。"
+            exit 1
+        fi
+    else
+        port="$(find_free_port)" || {
+            log_error "未能找到空闲端口。"
+            exit 1
+        }
+    fi
+
+    printf '%s\n' "${port}"
+}
+
+generate_psk() {
+    local psk
+
+    if command -v openssl >/dev/null 2>&1; then
+        psk="$(openssl rand -hex 24)"
+    else
+        psk="$(
+            od -An -N32 -tx1 /dev/urandom |
+                tr -d ' \n'
+        )"
+    fi
+
+    if [[ -z "${psk}" ]]; then
+        log_error "生成 PSK 失败。"
+        exit 1
+    fi
+
+    printf '%s\n' "${psk}"
+}
+
+backup_file() {
+    local file_path="$1"
+
+    if [[ -f "${file_path}" ]]; then
+        cp -a \
+            "${file_path}" \
+            "${file_path}.bak.$(date '+%Y%m%d%H%M%S')"
+    fi
+}
+
+write_config() {
+    local port="$1"
+    local psk="$2"
+
+    mkdir -p "${CONFIG_DIR}"
+    backup_file "${CONFIG_FILE}"
+
+    cat >"${CONFIG_FILE}" <<EOF
+[snell-server]
+listen = 0.0.0.0:${port}
+psk = ${psk}
+ipv6 = false
+EOF
+
+    chown root:root "${CONFIG_FILE}"
+    chmod 0600 "${CONFIG_FILE}"
+
+    cat >"${STATE_FILE}" <<EOF
+SNELL_VERSION='${SNELL_VERSION}'
+SNELL_PORT='${port}'
+SNELL_PSK='${psk}'
+EOF
+
+    chown root:root "${STATE_FILE}"
+    chmod 0600 "${STATE_FILE}"
+
+    log_ok "配置文件已写入 ${CONFIG_FILE}"
+}
+
+configure_bbr() {
+    local congestion_controls=""
+    local current_control=""
+
+    log_info "配置 BBR..."
+
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+
+    cat >"${SYSCTL_FILE}" <<'EOF'
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+
+    chmod 0644 "${SYSCTL_FILE}"
+
+    # 不执行 sysctl -p，避免加载 /etc/sysctl.conf 中错误的 eth1 配置。
+    if sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 &&
+        sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; then
+        congestion_controls="$(
+            sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null ||
+                true
+        )"
+
+        current_control="$(
+            sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null ||
+                true
+        )"
+
+        if [[ " ${congestion_controls} " == *" bbr "* &&
+            "${current_control}" == "bbr" ]]; then
+            log_ok "BBR 已启用。"
+            return 0
+        fi
+    fi
+
+    log_warn "当前内核可能不支持 BBR，Snell 仍可正常安装和运行。"
+    log_warn "可用拥塞算法: ${congestion_controls:-未知}"
+}
+
+open_firewall_port() {
+    local port="$1"
+    local opened="false"
+
+    log_info "检查防火墙..."
+
+    if command -v firewall-cmd >/dev/null 2>&1 &&
+        systemctl is-active --quiet firewalld; then
+
+        firewall-cmd \
+            --permanent \
+            --add-port="${port}/tcp" >/dev/null
+
+        firewall-cmd \
+            --permanent \
+            --add-port="${port}/udp" >/dev/null
+
+        firewall-cmd --reload >/dev/null
+
+        log_ok "firewalld 已放行 TCP/UDP 端口 ${port}。"
+        opened="true"
+    fi
+
+    if [[ "${opened}" == "false" ]] &&
+        command -v ufw >/dev/null 2>&1; then
+
+        local ufw_status
+        ufw_status="$(ufw status 2>/dev/null | head -n 1 || true)"
+
+        if [[ "${ufw_status}" == *"active"* ]]; then
+            ufw allow "${port}/tcp" >/dev/null
+            ufw allow "${port}/udp" >/dev/null
+
+            log_ok "ufw 已放行 TCP/UDP 端口 ${port}。"
+            opened="true"
+        fi
+    fi
+
+    if [[ "${opened}" == "false" ]] &&
+        command -v nft >/dev/null 2>&1; then
+
+        if nft list ruleset 2>/dev/null |
+            grep -qE 'hook[[:space:]]+input'; then
+            log_warn "检测到 nftables，但未自动修改规则。"
+            log_warn "请确认 TCP/UDP 端口 ${port} 已放行。"
+            opened="true"
+        fi
+    fi
+
+    if [[ "${opened}" == "false" ]] &&
+        command -v iptables >/dev/null 2>&1; then
+
+        if ! iptables -C INPUT \
+            -p tcp \
+            --dport "${port}" \
+            -j ACCEPT 2>/dev/null; then
+
+            iptables -I INPUT \
+                -p tcp \
+                --dport "${port}" \
+                -j ACCEPT
+        fi
+
+        if ! iptables -C INPUT \
+            -p udp \
+            --dport "${port}" \
+            -j ACCEPT 2>/dev/null; then
+
+            iptables -I INPUT \
+                -p udp \
+                --dport "${port}" \
+                -j ACCEPT
+        fi
+
+        log_warn "iptables 已临时放行 TCP/UDP 端口 ${port}。"
+        log_warn "重启后规则可能失效，请根据系统保存 iptables 规则。"
+        opened="true"
+    fi
+
+    if [[ "${opened}" == "false" ]]; then
+        log_warn "未检测到已启用的防火墙管理工具。"
+        log_warn "请在云服务器安全组中放行 TCP/UDP 端口 ${port}。"
+    fi
+}
+
+write_systemd_service() {
+    backup_file "${SERVICE_FILE}"
+
+    cat >"${SERVICE_FILE}" <<EOF
+[Unit]
+Description=Snell Proxy Server
+Documentation=https://kb.nssurge.com/surge-knowledge-base/release-notes/snell
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=${INSTALL_PATH} -c ${CONFIG_FILE}
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=${CONFIG_DIR}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    chmod 0644 "${SERVICE_FILE}"
+
+    systemctl daemon-reload
+    systemctl enable snell.service >/dev/null
+    systemctl restart snell.service
+
+    sleep 2
+
+    if ! systemctl is-active --quiet snell.service; then
+        log_error "Snell 服务启动失败。"
+        systemctl status snell.service --no-pager -l || true
+        journalctl -u snell.service -n 50 --no-pager || true
+        exit 1
+    fi
+
+    log_ok "Snell 服务已启动。"
+}
+
+get_public_ipv4() {
+    local services=(
+        "https://api.ipify.org"
+        "https://ifconfig.me/ip"
+        "https://icanhazip.com"
+        "https://ipinfo.io/ip"
+    )
+
+    local service
+    local ip=""
+
+    for service in "${services[@]}"; do
+        if command -v curl >/dev/null 2>&1; then
+            ip="$(
+                curl \
+                    -4 \
+                    --fail \
+                    --silent \
+                    --show-error \
+                    --connect-timeout 5 \
+                    --max-time 8 \
+                    "${service}" 2>/dev/null ||
+                    true
+            )"
+        else
+            ip="$(
+                wget \
+                    -qO- \
+                    --timeout=8 \
+                    "${service}" 2>/dev/null ||
+                    true
+            )"
+        fi
+
+        ip="$(printf '%s' "${ip}" | tr -d '[:space:]')"
+
+        if [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            printf '%s\n' "${ip}"
+            return 0
+        fi
+    done
+
+    printf '%s\n' "SERVER_IP"
+}
+
+get_city() {
+    local city="Snell"
+
+    if command -v curl >/dev/null 2>&1; then
+        city="$(
+            curl \
+                --fail \
+                --silent \
+                --show-error \
+                --connect-timeout 5 \
+                --max-time 8 \
+                "https://ipinfo.io/city" 2>/dev/null ||
+                true
+        )"
+    fi
+
+    city="$(printf '%s' "${city}" | tr -d '\r\n')"
+
+    if [[ -z "${city}" ]]; then
+        city="Snell"
+    fi
+
+    printf '%s\n' "${city}"
+}
+
+verify_listening_port() {
+    local port="$1"
+
+    if command -v ss >/dev/null 2>&1; then
+        if ss -H -lntup 2>/dev/null |
+            grep -Eq "(^|:|\])${port}([[:space:]]|$)"; then
+            log_ok "检测到 Snell 正在监听端口 ${port}。"
+            return 0
+        fi
+    fi
+
+    log_warn "暂未从 ss 输出中确认监听端口，请检查服务日志。"
+    return 0
+}
+
+show_configuration() {
+    local port=""
+    local psk=""
+    local public_ip
+    local city
+
+    if [[ -f "${STATE_FILE}" ]]; then
+        # shellcheck disable=SC1090
+        source "${STATE_FILE}"
+        port="${SNELL_PORT:-}"
+        psk="${SNELL_PSK:-}"
+    fi
+
+    if [[ -z "${port}" || -z "${psk}" ]] &&
+        [[ -f "${CONFIG_FILE}" ]]; then
+
+        port="$(
+            awk -F':' \
+                '/^[[:space:]]*listen[[:space:]]*=/{print $NF}' \
+                "${CONFIG_FILE}" |
+                tr -d '[:space:]'
+        )"
+
+        psk="$(
+            awk -F'=' \
+                '/^[[:space:]]*psk[[:space:]]*=/{print $2}' \
+                "${CONFIG_FILE}" |
+                xargs
+        )"
+    fi
+
+    if [[ -z "${port}" || -z "${psk}" ]]; then
+        log_error "未找到 Snell 配置信息。"
+        exit 1
+    fi
+
+    public_ip="$(get_public_ipv4)"
+    city="$(get_city)"
+
+    printf '\n'
+    printf '%s\n' "============================================================"
+    printf '%s\n' " Snell Server 配置信息"
+    printf '%s\n' "============================================================"
+    printf ' 版本      : %s\n' "${SNELL_VERSION}"
+    printf ' 服务状态  : %s\n' "$(
+        systemctl is-active snell.service 2>/dev/null ||
+            printf '%s' "unknown"
+    )"
+    printf ' 配置文件  : %s\n' "${CONFIG_FILE}"
+    printf ' 公网 IP   : %s\n' "${public_ip}"
+    printf ' 监听端口  : %s\n' "${port}"
+    printf ' PSK       : %s\n' "${psk}"
+    printf '\n'
+    printf '%s\n' "Surge 配置："
+    printf '%s = snell, %s, %s, psk=%s, version=5, tfo=true\n' \
+        "${city}" \
+        "${public_ip}" \
+        "${port}" \
+        "${psk}"
+    printf '\n'
+    printf '%s\n' "兼容 v4 客户端配置："
+    printf '%s = snell, %s, %s, psk=%s, version=4, tfo=true\n' \
+        "${city}" \
+        "${public_ip}" \
+        "${port}" \
+        "${psk}"
+    printf '%s\n' "============================================================"
+    printf '\n'
+
+    log_warn "还需要在云服务商安全组中放行 TCP/UDP 端口 ${port}。"
+}
+
+install_snell() {
+    local port
+    local psk
+
+    require_root
+    require_systemd
+    detect_package_manager
+    install_dependencies
+
+    port="$(determine_port)"
+    psk="$(generate_psk)"
+
+    log_info "使用端口: ${port}"
+
+    download_snell
+    write_config "${port}" "${psk}"
+    configure_bbr
+    open_firewall_port "${port}"
+    write_systemd_service
+    verify_listening_port "${port}"
+    show_configuration
+}
+
+show_status() {
+    require_root
+    require_systemd
+
+    systemctl status snell.service --no-pager -l || true
+
+    printf '\n'
+    journalctl \
+        -u snell.service \
+        -n 30 \
+        --no-pager || true
+}
+
+restart_snell() {
+    require_root
+    require_systemd
+
+    systemctl restart snell.service
+
+    if systemctl is-active --quiet snell.service; then
+        log_ok "Snell 服务已重启。"
+    else
+        log_error "Snell 服务重启失败。"
+        systemctl status snell.service --no-pager -l || true
+        exit 1
+    fi
+}
+
+uninstall_snell() {
+    local port=""
+
+    require_root
+    require_systemd
+
+    if [[ -f "${STATE_FILE}" ]]; then
+        # shellcheck disable=SC1090
+        source "${STATE_FILE}"
+        port="${SNELL_PORT:-}"
+    fi
+
+    log_warn "即将删除以下内容："
+    log_warn "服务文件: ${SERVICE_FILE}"
+    log_warn "程序文件: ${INSTALL_PATH}"
+    log_warn "配置目录: ${CONFIG_DIR}"
+    log_warn "BBR 配置: ${SYSCTL_FILE}"
+
+    read -r -p "确认卸载 Snell？输入 YES 继续: " confirmation
+
+    if [[ "${confirmation}" != "YES" ]]; then
+        log_info "已取消卸载。"
+        exit 0
+    fi
+
+    systemctl disable --now snell.service >/dev/null 2>&1 || true
+
+    rm -f "${SERVICE_FILE}"
+    rm -f "${INSTALL_PATH}"
+    rm -f "${SYSCTL_FILE}"
+    rm -rf "${CONFIG_DIR}"
+
+    systemctl daemon-reload
+    systemctl reset-failed >/dev/null 2>&1 || true
+
+    log_ok "Snell 已卸载。"
+
+    if [[ -n "${port}" ]]; then
+        log_warn "未自动删除防火墙规则。"
+        log_warn "原 Snell 端口为 ${port}，请按需手动关闭。"
+    fi
+}
+
+show_help() {
+    cat <<EOF
+用法：
+
+  bash ${SCRIPT_NAME} install
+      自动选择 20000 到 40000 之间的空闲端口并安装。
+
+  bash ${SCRIPT_NAME} install 30000
+      使用指定端口 30000 安装。
+
+  bash ${SCRIPT_NAME} status
+      查看服务状态及最近日志。
+
+  bash ${SCRIPT_NAME} restart
+      重启 Snell 服务。
+
+  bash ${SCRIPT_NAME} show
+      显示当前 Snell 和 Surge 配置信息。
+
+  bash ${SCRIPT_NAME} uninstall
+      卸载 Snell。
+
+  bash ${SCRIPT_NAME} help
+      显示帮助。
+EOF
+}
+
+main() {
+    case "${ACTION}" in
+        install)
+            install_snell
+            ;;
+
+        status)
+            show_status
+            ;;
+
+        restart)
+            restart_snell
+            ;;
+
+        show)
+            require_root
+            require_systemd
+            show_configuration
+            ;;
+
+        uninstall)
+            uninstall_snell
+            ;;
+
+        help|-h|--help)
+            show_help
+            ;;
+
+        *)
+            log_error "未知操作: ${ACTION}"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
